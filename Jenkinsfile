@@ -1,18 +1,21 @@
+
 pipeline {
     agent any
 
-    tools {
-        nodejs 'Node20'
+    options {
+        disableConcurrentBuilds()
     }
 
     environment {
         AWS_REGION = 'ap-south-1'
         ECR_REGISTRY = '746430304915.dkr.ecr.ap-south-1.amazonaws.com'
         APP_DIR = '/home/ubuntu/smart-task-rishi'
+        COMPOSE_PROJECT = 'smart-task-rishi'
         IMAGE_TAG = "${BUILD_NUMBER}"
     }
 
     stages {
+
         stage('Checkout') {
             steps {
                 git branch: 'main',
@@ -20,10 +23,11 @@ pipeline {
             }
         }
 
-        stage('Validate') {
+        stage('Validate Source') {
             steps {
                 sh '''
                     set -e
+
                     test -f docker-compose.ecr.yml
                     test -f frontend/Dockerfile
                     test -f auth-service_1784011000189/Dockerfile
@@ -31,6 +35,7 @@ pipeline {
                     test -f notification-service/Dockerfile
                     test -f report-service/Dockerfile
                     test -f api-gateway_1784010924579/Dockerfile
+
                     echo "Source validation successful"
                 '''
             }
@@ -40,51 +45,86 @@ pipeline {
             steps {
                 sh '''
                     set -e
+
                     aws sts get-caller-identity
-                    aws ecr get-login-password --region "$AWS_REGION" |
-                    docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+                    aws ecr get-login-password \
+                        --region "$AWS_REGION" |
+                    docker login \
+                        --username AWS \
+                        --password-stdin "$ECR_REGISTRY"
+
+                    echo "ECR login successful"
                 '''
             }
         }
 
-        stage('Build and Push Images') {
+        stage('Build Docker Images') {
             steps {
                 sh '''
                     set -e
 
-                    docker build -t $ECR_REGISTRY/smart-task-auth-service:$IMAGE_TAG ./auth-service_1784011000189
-                    docker build -t $ECR_REGISTRY/smart-task-task-service:$IMAGE_TAG ./task-service
-                    docker build -t $ECR_REGISTRY/smart-task-notification-service:$IMAGE_TAG ./notification-service
-                    docker build -t $ECR_REGISTRY/smart-task-report-service:$IMAGE_TAG ./report-service
-                    docker build -t $ECR_REGISTRY/smart-task-api-gateway:$IMAGE_TAG ./api-gateway_1784010924579
-                    docker build -t $ECR_REGISTRY/smart-task-frontend:$IMAGE_TAG ./frontend
+                    docker build -t "$ECR_REGISTRY/smart-task-auth-service:$IMAGE_TAG" ./auth-service_1784011000189
+
+                    docker build -t "$ECR_REGISTRY/smart-task-task-service:$IMAGE_TAG" ./task-service
+
+                    docker build -t "$ECR_REGISTRY/smart-task-notification-service:$IMAGE_TAG" ./notification-service
+
+                    docker build -t "$ECR_REGISTRY/smart-task-report-service:$IMAGE_TAG" ./report-service
+
+                    docker build -t "$ECR_REGISTRY/smart-task-api-gateway:$IMAGE_TAG" ./api-gateway_1784010924579
+
+                    docker build -t "$ECR_REGISTRY/smart-task-frontend:$IMAGE_TAG" ./frontend
+
+                    echo "All images built successfully"
+                '''
+            }
+        }
+
+        stage('Push Images to ECR') {
+            steps {
+                sh '''
+                    set -e
 
                     for service in auth-service task-service notification-service report-service api-gateway frontend
                     do
-                        docker tag $ECR_REGISTRY/smart-task-$service:$IMAGE_TAG $ECR_REGISTRY/smart-task-$service:latest
-                        docker push $ECR_REGISTRY/smart-task-$service:$IMAGE_TAG
-                        docker push $ECR_REGISTRY/smart-task-$service:latest
+                        IMAGE="$ECR_REGISTRY/smart-task-$service"
+
+                        docker tag "$IMAGE:$IMAGE_TAG" "$IMAGE:latest"
+
+                        docker push "$IMAGE:$IMAGE_TAG"
+                        docker push "$IMAGE:latest"
                     done
+
+                    echo "All images pushed successfully"
                 '''
             }
         }
 
-        stage('Deploy with Docker Compose') {
+        stage('Deploy Docker Compose') {
             steps {
                 sh '''
                     set -e
-                    cd "$APP_DIR"
 
-                    export IMAGE_TAG="$IMAGE_TAG"
+                    test -r "$APP_DIR/.env"
 
-                    docker compose -p smart-task-rishi \
-                        -f docker-compose.ecr.yml pull
+                    docker compose \
+                        --env-file "$APP_DIR/.env" \
+                        -p "$COMPOSE_PROJECT" \
+                        -f "$WORKSPACE/docker-compose.ecr.yml" \
+                        pull
 
-                    docker compose -p smart-task-rishi \
-                        -f docker-compose.ecr.yml up -d
+                    docker compose \
+                        --env-file "$APP_DIR/.env" \
+                        -p "$COMPOSE_PROJECT" \
+                        -f "$WORKSPACE/docker-compose.ecr.yml" \
+                        up -d
 
-                    docker compose -p smart-task-rishi \
-                        -f docker-compose.ecr.yml ps
+                    docker compose \
+                        --env-file "$APP_DIR/.env" \
+                        -p "$COMPOSE_PROJECT" \
+                        -f "$WORKSPACE/docker-compose.ecr.yml" \
+                        ps
                 '''
             }
         }
@@ -93,9 +133,31 @@ pipeline {
             steps {
                 sh '''
                     set -e
-                    sleep 10
-                    curl -fsS http://127.0.0.1:5000/health
-                    curl -fsSI http://127.0.0.1:8081
+
+                    echo "Checking API Gateway..."
+
+                    for i in $(seq 1 12)
+                    do
+                        if curl -fsS http://127.0.0.1:5000/health; then
+                            break
+                        fi
+
+                        if [ "$i" -eq 12 ]; then
+                            echo "API Gateway health check failed"
+                            exit 1
+                        fi
+
+                        sleep 5
+                    done
+
+                    echo "Checking Frontend..."
+
+                    curl -fsS http://127.0.0.1:8081/ > /dev/null
+
+                    echo "Checking Public Website..."
+
+                    curl -fsS http://127.0.0.1/ > /dev/null
+
                     echo "Deployment verification successful"
                 '''
             }
@@ -104,11 +166,15 @@ pipeline {
 
     post {
         success {
-            echo 'Smart Task CI/CD Pipeline Completed Successfully'
+            echo 'SUCCESS: Smart Task CI/CD Pipeline Completed!'
         }
+
         failure {
-            echo 'Smart Task CI/CD Pipeline Failed'
+            echo 'FAILURE: Check Jenkins Console Output'
+        }
+
+        always {
+            echo 'Pipeline execution finished'
         }
     }
 }
-EOF
